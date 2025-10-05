@@ -11,10 +11,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy CSV files explicitly
-COPY *.csv .
+# Copy CSV files first (explicit)
+COPY All_Diets.csv ./
+COPY *.csv ./
 
-# Copy all application code
+# Copy Python scripts
+COPY *.py ./
+
+# Copy everything else
 COPY . .
 
 ENV PYTHONUNBUFFERED=1
