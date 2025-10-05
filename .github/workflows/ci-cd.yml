@@ -1,0 +1,274 @@
+name: CI/CD Pipeline for Nutritional Insights App
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # Allows manual triggering
+
+env:
+  DOCKER_IMAGE_NAME: nutritional-insights-app
+  DOCKER_REGISTRY: docker.io  # Change to your registry
+  PYTHON_VERSION: '3.9'
+
+jobs:
+  # Job 1: Code Quality and Testing
+  test:
+    name: Test Python Application
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Cache Python dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 pytest pytest-cov black pylint
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+    
+    - name: Lint with flake8
+      run: |
+        # Stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # Exit-zero treats all errors as warnings
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    
+    - name: Format check with Black
+      run: |
+        black --check --diff .
+      continue-on-error: true
+    
+    - name: Run Pylint
+      run: |
+        pylint **/*.py --exit-zero
+      continue-on-error: true
+    
+    - name: Run unit tests with pytest
+      run: |
+        pytest tests/ -v --cov=./ --cov-report=xml --cov-report=html --cov-report=term
+    
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+      continue-on-error: true
+
+  # Job 2: Build and Push Docker Image
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test  # Only run after tests pass
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+    
+    - name: Log in to Docker Hub
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v2
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v4
+      with:
+        images: ${{ env.DOCKER_REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=raw,value=latest,enable={{is_default_branch}}
+          type=sha,prefix={{branch}}-
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        file: ./Dockerfile
+        platforms: linux/amd64,linux/arm64
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          VCS_REF=${{ github.sha }}
+          VERSION=${{ steps.meta.outputs.version }}
+    
+    - name: Run Trivy vulnerability scanner
+      if: github.event_name != 'pull_request'
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.DOCKER_REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:latest
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: Upload Trivy results to GitHub Security
+      if: github.event_name != 'pull_request'
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  # Job 3: Deploy to Local Environment via SSH
+  deploy-local:
+    name: Deploy to Local Environment
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Deploy to local environment via SSH
+      uses: appleboy/ssh-action@v0.1.5
+      with:
+        host: ${{ secrets.LOCAL_HOST }}
+        username: ${{ secrets.LOCAL_USERNAME }}
+        key: ${{ secrets.LOCAL_SSH_KEY }}
+        port: ${{ secrets.LOCAL_SSH_PORT }}
+        script: |
+          # Pull the latest image
+          docker pull ${{ env.DOCKER_REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:latest
+          
+          # Stop and remove existing container
+          docker stop nutritional-app || true
+          docker rm nutritional-app || true
+          
+          # Run the new container
+          docker run -d \
+            --name nutritional-app \
+            --restart unless-stopped \
+            -p 8080:8080 \
+            -e DATABASE_URL=${{ secrets.DATABASE_URL }} \
+            -e API_KEY=${{ secrets.API_KEY }} \
+            ${{ env.DOCKER_REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:latest
+          
+          # Health check
+          sleep 10
+          curl -f http://localhost:8080/health || exit 1
+          
+          # Clean up old images
+          docker image prune -f
+
+  # Job 4: Deploy to Kubernetes (Alternative/Additional Deployment)
+  deploy-k8s:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+    
+    - name: Configure kubectl
+      run: |
+        echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > kubeconfig
+        export KUBECONFIG=kubeconfig
+    
+    - name: Deploy to Kubernetes
+      run: |
+        # Update deployment with new image
+        kubectl set image deployment/nutritional-app \
+          nutritional-app=${{ env.DOCKER_REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:latest \
+          --namespace=production
+        
+        # Wait for rollout to complete
+        kubectl rollout status deployment/nutritional-app --namespace=production
+        
+        # Verify deployment
+        kubectl get pods --namespace=production
+
+  # Job 5: Integration Tests (Post-Deployment)
+  integration-tests:
+    name: Run Integration Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-local]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install test dependencies
+      run: |
+        pip install requests pytest pytest-html
+    
+    - name: Run integration tests
+      run: |
+        pytest tests/integration/ -v --html=integration-test-report.html
+      env:
+        API_ENDPOINT: ${{ secrets.LOCAL_HOST }}:8080
+    
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: integration-test-results
+        path: integration-test-report.html
+
+  # Job 6: Notify Results
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    needs: [test, build-and-push, deploy-local]
+    if: always()
+    
+    steps:
+    - name: Send Slack notification
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        text: |
+          Pipeline Status: ${{ job.status }}
+          Commit: ${{ github.sha }}
+          Author: ${{ github.actor }}
+          Message: ${{ github.event.head_commit.message }}
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+      if: always()
+    
+    - name: Create GitHub deployment status
+      uses: bobheadxi/deployments@v1
+      if: github.ref == 'refs/heads/main'
+      with:
+        step: finish
+        token: ${{ secrets.GITHUB_TOKEN }}
+        status: ${{ job.status }}
+        env: production
+        deployment_id: ${{ steps.deployment.outputs.deployment_id }}
