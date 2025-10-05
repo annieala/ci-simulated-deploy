@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 # 1. Load dataset
 # -------------------------------
 df = pd.read_csv("All_Diets.csv")
-
+gi
 # -------------------------------
 # 2. Handle missing data (fill missing values with mean)
 # -------------------------------
